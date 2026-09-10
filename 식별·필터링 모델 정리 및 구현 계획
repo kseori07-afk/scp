@@ -1,0 +1,97 @@
+# AI-NAC 식별·필터링 모델 정리 및 구현 계획
+
+## 요약
+
+AI-NAC 프록시는 AI Agent 프로세스에만 설정하는 것을 전제로 한다. 프록시에 들어온 모든 요청은 Agent 요청으로 간주하며 다음 순서로 검증한다.
+
+```text
+출발지 IP
+→ X-Agent-ID
+→ X-Agent-Token
+→ Protocol
+→ Agent allowed_protocol
+→ 실제 목적지 host:port
+→ Agent allowed_targets
+→ 세부 Policy
+→ Risk/Event/Log
+```
+
+## 필터링 기준
+
+| 요소 | MCP | A2A | 적용 방식 |
+|---|---|---|---|
+| Source IP | 필수 | 필수 | 등록 Agent의 고정 IP와 정확히 일치해야 함 |
+| X-Agent-ID | 필수 | 필수 | Agent 레코드 조회 |
+| X-Agent-Token | 필수 | 필수 | 저장된 해시와 비교 |
+| Protocol | `mcp` | `a2a` | Agent의 `allowed_protocol`과 불일치하면 즉시 차단 |
+| 실제 Target | `host:port` | `host:port` | 프록시가 실제 요청에서 추출한 값을 신뢰 |
+| MCP Tool | `params.name` | 해당 없음 | 세부 Policy 조건 |
+| A2A Skill/Method | 해당 없음 | `skill` 또는 JSON-RPC `method` | 세부 Policy 조건 |
+| `server` | 선택적 메타데이터 | 해당 없음 | 접근제어에는 사용하지 않고 로그에만 기록 |
+| `target_agent` | 없음 | 선택적 메타데이터 | 접근제어에는 사용하지 않고 로그에만 기록 |
+| `caller_agent` | 없음 | 선택적 메타데이터 | `X-Agent-ID`가 실제 호출자이며 본문 값은 보조 정보 |
+
+MCP 요청에는 `target_agent`를 요구하지 않는다. MCP 서버의 실제 대상은 요청 본문이 아니라 프록시가 관찰한 `host:port`다.
+
+## 구현 변경
+
+- Agent 테이블에 단일 고정 IPv4 `source_ip` 컬럼을 추가한다.
+  - 기존 DB는 시작 시 `ALTER TABLE` 기반으로 자동 마이그레이션한다.
+  - 기존 Agent의 `source_ip`는 미설정 상태로 남기며, 관리자가 설정하기 전까지 요청을 차단한다.
+  - 신규 Agent 등록에서는 `source_ip`를 필수로 받는다.
+- `allowed_targets`는 쉼표로 구분된 정확한 `host:port` 목록으로 정의한다.
+  - 예: `192.168.56.104:9000,api.example.com:443`
+  - 호스트명은 소문자로 정규화한다.
+  - 포트 생략은 허용하지 않는다.
+  - 목적지가 목록 밖이면 Risk 점수만 올리는 것이 아니라 Policy 조회 전에 Hard Deny한다.
+- mitmproxy에서 `flow.request.host`와 `flow.request.port`를 이용해 실제 목적지를 구성한다.
+  - `pretty_host`만 사용하던 구현을 교체해 포트까지 구분한다.
+- `allowed_protocol`도 Hard Deny로 적용한다.
+  - 값은 `mcp`, `a2a`, `*`만 허용한다.
+  - `unknown` 요청은 Agent 프록시에서 기본 차단한다.
+- 세부 Policy의 `target`도 실제 `host:port`를 사용한다.
+  - MCP `tools/call`은 `params.name`을 `tool` 조건으로 사용한다.
+  - 그 외 MCP 요청은 JSON-RPC `method`를 operation 조건으로 사용한다.
+  - A2A는 `skill`이 있으면 이를 사용하고, 없으면 JSON-RPC `method`를 사용한다.
+- `server`, `target_agent`, `caller_agent`는 `claimed_target`/보조 메타데이터로만 기록한다.
+  - 실제 목적지와 문자열이 다르다는 이유만으로 `TARGET_MISMATCH` 점수를 부여하지 않는다.
+  - 향후 Target Registry가 생기기 전까지 논리 ID의 진위를 판정하지 않는다.
+- 로그에 실제 source IP, 실제 `host:port`, claimed target을 구분해 저장한다.
+- 대시보드 Agent 등록·수정 화면에 `source_ip` 필드를 추가하고 `allowed_targets` 예시를 `host:port` 형식으로 표시한다.
+- 테스트 가이드를 Agent 프로세스 전용 프록시 설정으로 수정한다.
+  - `/etc/environment` 전역 설정 대신 Agent 실행 명령 또는 systemd 서비스에만 프록시 환경변수를 지정한다.
+  - Mint1은 `source_ip=192.168.56.102`
+  - `allowed_targets=192.168.56.104:9000`
+  - MCP/A2A 정책 target도 `192.168.56.104:9000`
+
+## API 및 데이터 호환성
+
+- `POST /api/agents` 입력에 필수 `source_ip`를 추가한다.
+- Agent 수정 API에서 `source_ip`, `allowed_protocol`, `allowed_targets`를 수정할 수 있게 한다.
+- 기존 Agent 조회 응답에도 `source_ip`를 포함한다.
+- `/api/evaluate`의 `source`와 `destination`은 각각 IP와 `host:port` 형식을 요구한다.
+- 기존 정책 target에 포트가 없으면 더 이상 매칭하지 않는다. 관리자가 `host:port` 형식으로 수정해야 한다.
+- 기존 `nac.db`와 로그는 보존하며, 마이그레이션 실패 시 서버 시작을 중단하고 오류를 명확히 출력한다.
+
+## 테스트 계획
+
+- 올바른 ID·토큰·IP·protocol·allowed target·ALLOW 정책이면 전달
+- ID와 토큰이 맞아도 source IP가 다르면 차단
+- 기존 Agent처럼 source IP가 미설정이면 차단
+- allowed protocol 밖의 MCP/A2A 요청 차단
+- allowed target 밖의 `host:port`는 ALLOW 정책이 있어도 차단
+- 동일 IP의 서로 다른 포트가 별도 대상으로 처리되는지 확인
+- MCP 요청에 `target_agent`나 `server`가 없어도 정상 검사
+- 임의의 `server` 값을 넣어도 실제 정책 target이 바뀌지 않는지 확인
+- A2A `target_agent`가 실제 IP와 달라도 접근 판단에는 영향을 주지 않고 로그에만 남는지 확인
+- Agent 헤더 누락, 잘못된 토큰, unknown protocol은 Default Deny
+- 기존 DB 자동 마이그레이션과 미등록 source IP 차단 확인
+- Mint1 Agent 요청은 프록시를 경유하고 일반 브라우저는 직접 통신하는 통합 테스트
+
+## 확정된 전제와 한계
+
+- AI-NAC 프록시는 OS 전역이 아니라 Agent 프로세스에만 설정한다.
+- Agent 하나는 단일 고정 IPv4를 사용한다.
+- NAT, 동적 IP, 복수 NIC, CIDR 등록은 v1 범위에서 제외한다.
+- 논리적 MCP 서버명과 A2A Agent ID는 인증된 식별자가 아니므로 v1 접근제어에는 사용하지 않는다.
+- 사용자가 Agent의 프록시 설정을 제거하거나 우회하는 문제는 네트워크 강제 라우팅·mTLS·프록시 인증이 없는 현재 구조의 한계로 문서화한다.
